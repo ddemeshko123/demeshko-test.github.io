@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Cloth – WebGPU</title>
+  <style>
+    html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#111; }
+    canvas { display:block; width:100%; height:100%; }
+    #controls {
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      z-index: 10;
+      background: rgba(0,0,0,0.5);
+      padding: 8px 14px;
+      border-radius: 4px;
+      color: #fff;
+      font: 14px sans-serif;
+    }
+    #controls button {
+      background: #3a4a5a;
+      color: white;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    #controls button:hover {
+      background: #5a7a9a;
+    }
+  </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="controls">
+  <button id="gravityBtn">Gravity: ON</button>
+</div>
+
+<script>
+'use strict';
+
+const number_tringles = 30;
+const size_m = 2;
+
+class Cloth {
+
+  constructor(n, size = 2) {
+    this.size = size;
+    this.substeps = 12;
+    this.iterations = 1;
+    this.stretchCompliance = 0.5e-4;
+    this.flexionCompliance = 1e8;
+    this.bendCompliance = 5e4;
+    this.stretchDamping = 1e-2;
+    this.bendDamping = 1e-5;
+    this.gravity = 9.81;
+    this.arealDensity = 0.2;
+    this.amplitude = 0.3;
+    this.omega = 5.0;
+    this.rebuild(n);
+  }
+
+  rebuild(n) {
+    if (n % 2 !== 0) n += 1;
+    this.n = n;
+    this.side = n + 1;
+    this.count = this.side * this.side;
+    this.pos = new Float32Array(this.count * 3);
+    this.prevPos = new Float32Array(this.count * 3);
+    this.vel = new Float32Array(this.count * 3);
+    this.w = new Float32Array(this.count);
+    this.pinned = new Uint8Array(this.count);
+    this.pinPos = new Float32Array(this.count * 3);
+    this.centreIndex = (n / 2) * this.side + (n / 2);
+    this.reset();
+    this._buildDistanceConstraints();
+    this._buildBendingHinges();
+  }
+
+  index(i, j) { return j * this.side + i; }
+
+  reset() {
+    const { n, size } = this;
+    const step = size / n, half = size / 2;
+    for (let j = 0; j <= n; j++) {
+      for (let i = 0; i <= n; i++) {
+        const k = this.index(i, j) * 3;
+        this.pos[k] = -half + i * step;
+        this.pos[k + 1] = -half + j * step;
+        this.pos[k + 2] = 0;
+      }
+    }
+    this.prevPos.set(this.pos);
+    this.vel.fill(0);
+    this.w.fill(this.count / (this.arealDensity * this.size * this.size));
+    this.pinned.fill(0);
+    for (const [i, j] of [[0, 0], [n, 0], [0, n], [n, n]]) {
+      const p = this.index(i, j);
+      this.pinned[p] = 1; this.w[p] = 0;
+    }
+    this.pinned[this.centreIndex] = 1;
+    this.w[this.centreIndex] = 0;
+    this.pinPos.set(this.pos);
+    this._clearMultipliers();
+  }
+
+  splitAC(i, j) { return ((i + j) & 1) === 0; }
+
+  cellCorners(i, j) {
+    return [this.index(i, j), this.index(i + 1, j),
+            this.index(i + 1, j + 1), this.index(i, j + 1)];
+  }
+
+  cellApex(i, j, edge) {
+    const [A, B, C, D] = this.cellCorners(i, j);
+    if (this.splitAC(i, j)) {
+      return { bottom: C, right: A, top: A, left: C }[edge];
+    }
+    return { bottom: D, right: D, top: B, left: B }[edge];
+  }
+
+  triangleIndices() {
+    const { n } = this;
+    const idx = new Uint32Array(n * n * 6);
+    let o = 0;
+    for (let j = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        const [A, B, C, D] = this.cellCorners(i, j);
+        if (this.splitAC(i, j)) {
+          idx[o++] = A; idx[o++] = B; idx[o++] = C; idx[o++] = A; idx[o++] = C; idx[o++] = D;
+        } else {
+          idx[o++] = A; idx[o++] = B; idx[o++] = D; idx[o++] = B; idx[o++] = C; idx[o++] = D;
+        }
+      }
+    }
+    return idx;
+  }
+
+  lineIndices() {
+    const { n } = this;
+    const idx = new Uint32Array(n * n * 10);
+    let o = 0;
+    const seg = (u, v) => { idx[o++] = u; idx[o++] = v; };
+    for (let j = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        const [A, B, C, D] = this.cellCorners(i, j);
+        seg(A, B); seg(B, C); seg(C, D); seg(D, A);
+        if (this.splitAC(i, j)) seg(A, C); else seg(B, D);
+      }
+    }
+    return idx;
+  }
+
+  _buildDistanceConstraints() {
+    const { n, pos } = this;
+    const a = [], b = [], rest = [];
+    const link = (ia, ib) => {
+      const ka = ia * 3, kb = ib * 3;
+      a.push(ia); b.push(ib);
+      rest.push(Math.hypot(pos[kb] - pos[ka], pos[kb+1] - pos[ka+1], pos[kb+2] - pos[ka+2]));
+    };
+    for (let j = 0; j <= n; j++) {
+      for (let i = 0; i <= n; i++) {
+        if (i < n) link(this.index(i, j), this.index(i + 1, j));
+        if (j < n) link(this.index(i, j), this.index(i, j + 1));
+      }
+    }
+    this.structuralCount = a.length;
+    for (let j = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        const [A, B, C, D] = this.cellCorners(i, j);
+        if (this.splitAC(i, j)) link(A, C); else link(B, D);
+      }
+    }
+    this.edgeCount = a.length;
+    for (let i = 0; i + 2 <= n; i++) {
+      link(this.index(i, 0), this.index(i + 2, 0));
+      link(this.index(i, n), this.index(i + 2, n));
+      link(this.index(0, i), this.index(0, i + 2));
+      link(this.index(n, i), this.index(n, i + 2));
+    }
+    this.ca = Int32Array.from(a);
+    this.cb = Int32Array.from(b);
+    this.crest = Float32Array.from(rest);
+    this.distCount = a.length;
+    this.clambda = new Float32Array(this.distCount);
+    const cell = this.size / n;
+    this.cscale = Float32Array.from(rest, (L) => L / cell);
+  }
+
+  _buildBendingHinges() {
+    const { n } = this;
+    const idx = [];
+    const hinge = (i0, i1, i2, i3) => { idx.push(i0, i1, i2, i3); };
+    for (let j = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        const [A, B, C, D] = this.cellCorners(i, j);
+        if (this.splitAC(i, j)) hinge(A, C, B, D);
+        else hinge(B, D, A, C);
+        if (j > 0) hinge(A, B, this.cellApex(i, j, 'bottom'), this.cellApex(i, j - 1, 'top'));
+        if (i > 0) hinge(A, D, this.cellApex(i, j, 'left'), this.cellApex(i - 1, j, 'right'));
+      }
+    }
+    this.hidx = Int32Array.from(idx);
+    this.hingeCount = idx.length / 4;
+    this.hrest = new Float32Array(this.hingeCount);
+    this.hlambda = new Float32Array(this.hingeCount);
+    for (let e = 0; e < this.hingeCount; e++) this.hrest[e] = this.dihedralAngle(e);
+  }
+
+  dihedralAngle(e) {
+    const { pos, hidx } = this;
+    const a = hidx[e*4]*3, b = hidx[e*4+1]*3, c = hidx[e*4+2]*3, d = hidx[e*4+3]*3;
+    const p2x = pos[b]-pos[a], p2y = pos[b+1]-pos[a+1], p2z = pos[b+2]-pos[a+2];
+    const p3x = pos[c]-pos[a], p3y = pos[c+1]-pos[a+1], p3z = pos[c+2]-pos[a+2];
+    const p4x = pos[d]-pos[a], p4y = pos[d+1]-pos[a+1], p4z = pos[d+2]-pos[a+2];
+    let n1x = p2y*p3z-p2z*p3y, n1y = p2z*p3x-p2x*p3z, n1z = p2x*p3y-p2y*p3x;
+    let n2x = p2y*p4z-p2z*p4y, n2y = p2z*p4x-p2x*p4z, n2z = p2x*p4y-p2y*p4x;
+    const l1 = Math.hypot(n1x,n1y,n1z), l2 = Math.hypot(n2x,n2y,n2z);
+    if (l1 < 1e-12 || l2 < 1e-12) return 0;
+    const dot = (n1x*n2x + n1y*n2y + n1z*n2z) / (l1*l2);
+    return Math.acos(Math.max(-1, Math.min(1, dot)));
+  }
+
+  _clearMultipliers() {
+    this.clambda?.fill(0);
+    this.hlambda?.fill(0);
+  }
+
+  _prescribe(time) {
+    const { pos, pinPos, pinned, count } = this;
+    for (let p = 0; p < count; p++) {
+      if (!pinned[p]) continue;
+      const k = p * 3;
+      pos[k] = pinPos[k]; pos[k + 1] = pinPos[k + 1]; pos[k + 2] = pinPos[k + 2];
+    }
+    this.pos[this.centreIndex * 3 + 2] = this.amplitude * Math.sin(this.omega * time);
+  }
+
+  _solveDistance(h) {
+    this._solveDistanceRange(h, 0, this.edgeCount, this.stretchCompliance);
+    this._solveDistanceRange(h, this.edgeCount, this.distCount, this.flexionCompliance);
+  }
+
+  _solveDistanceRange(h, from, to, compliance) {
+    const { pos, prevPos, w, ca, cb, crest, cscale, clambda } = this;
+    const invH2 = 1 / (h * h);
+    const beta = this.stretchDamping;
+    for (let c = from; c < to; c++) {
+      const pa = ca[c], pb = cb[c];
+      const wa = w[pa], wb = w[pb];
+      const wsum = wa + wb;
+      if (wsum === 0) continue;
+      const ka = pa * 3, kb = pb * 3;
+      const dx = pos[kb] - pos[ka], dy = pos[kb+1] - pos[ka+1], dz = pos[kb+2] - pos[ka+2];
+      const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+      if (dist < 1e-12) continue;
+      const C = dist - crest[c];
+      const alphaTilde = compliance * cscale[c] * invH2;
+      const gamma = alphaTilde * beta * h;
+      let cdot = 0;
+      if (gamma !== 0) {
+        cdot = ( dx*((pos[kb]  -prevPos[kb])  -(pos[ka]  -prevPos[ka]))
+               + dy*((pos[kb+1]-prevPos[kb+1])-(pos[ka+1]-prevPos[ka+1]))
+               + dz*((pos[kb+2]-prevPos[kb+2])-(pos[ka+2]-prevPos[ka+2])) ) / dist;
+      }
+      const dLambda = (-C - alphaTilde * clambda[c] - gamma * cdot)
+                    / ((1 + gamma) * wsum + alphaTilde);
+      clambda[c] += dLambda;
+      const s = dLambda / dist;
+      const sx = s * dx, sy = s * dy, sz = s * dz;
+      if (wa) { pos[ka] -= wa*sx; pos[ka+1] -= wa*sy; pos[ka+2] -= wa*sz; }
+      if (wb) { pos[kb] += wb*sx; pos[kb+1] += wb*sy; pos[kb+2] += wb*sz; }
+    }
+  }
+
+  _solveBending(h) {
+    const { pos, prevPos, w, hidx, hrest, hlambda, hingeCount } = this;
+    const alphaTilde = this.bendCompliance / (h * h);
+    const gamma = alphaTilde * this.bendDamping * h;
+    for (let e = 0; e < hingeCount; e++) {
+      const o = e * 4;
+      const i1 = hidx[o], i2 = hidx[o+1], i3 = hidx[o+2], i4 = hidx[o+3];
+      const w1 = w[i1], w2 = w[i2], w3 = w[i3], w4 = w[i4];
+      if (w1 === 0 && w2 === 0 && w3 === 0 && w4 === 0) continue;
+      const a = i1*3, b = i2*3, c = i3*3, f = i4*3;
+      const p2x = pos[b]-pos[a], p2y = pos[b+1]-pos[a+1], p2z = pos[b+2]-pos[a+2];
+      const p3x = pos[c]-pos[a], p3y = pos[c+1]-pos[a+1], p3z = pos[c+2]-pos[a+2];
+      const p4x = pos[f]-pos[a], p4y = pos[f+1]-pos[a+1], p4z = pos[f+2]-pos[a+2];
+      let n1x = p2y*p3z-p2z*p3y, n1y = p2z*p3x-p2x*p3z, n1z = p2x*p3y-p2y*p3x;
+      let n2x = p2y*p4z-p2z*p4y, n2y = p2z*p4x-p2x*p4z, n2z = p2x*p4y-p2y*p4x;
+      const len1 = Math.hypot(n1x,n1y,n1z), len2 = Math.hypot(n2x,n2y,n2z);
+      if (len1 < 1e-12 || len2 < 1e-12) continue;
+      n1x/=len1; n1y/=len1; n1z/=len1;
+      n2x/=len2; n2y/=len2; n2z/=len2;
+      let d = n1x*n2x + n1y*n2y + n1z*n2z;
+      d = d < -1 ? -1 : (d > 1 ? 1 : d);
+      const s2 = 1 - d*d;
+      if (s2 < 1e-10) continue;
+      const s = Math.sqrt(s2);
+      const C = Math.acos(d) - hrest[e];
+      const q3x = ((p2y*n2z-p2z*n2y) + (n1y*p2z-n1z*p2y)*d) / len1;
+      const q3y = ((p2z*n2x-p2x*n2z) + (n1z*p2x-n1x*p2z)*d) / len1;
+      const q3z = ((p2x*n2y-p2y*n2x) + (n1x*p2y-n1y*p2x)*d) / len1;
+      const q4x = ((p2y*n1z-p2z*n1y) + (n2y*p2z-n2z*p2y)*d) / len2;
+      const q4y = ((p2z*n1x-p2x*n1z) + (n2z*p2x-n2x*p2z)*d) / len2;
+      const q4z = ((p2x*n1y-p2y*n1x) + (n2x*p2y-n2y*p2x)*d) / len2;
+      const q2x = -((p3y*n2z-p3z*n2y) + (n1y*p3z-n1z*p3y)*d)/len1
+                  -((p4y*n1z-p4z*n1y) + (n2y*p4z-n2z*p4y)*d)/len2;
+      const q2y = -((p3z*n2x-p3x*n2z) + (n1z*p3x-n1x*p3z)*d)/len1
+                  -((p4z*n1x-p4x*n1z) + (n2z*p4x-n2x*p4z)*d)/len2;
+      const q2z = -((p3x*n2y-p3y*n2x) + (n1x*p3y-n1y*p3x)*d)/len1
+                  -((p4x*n1y-p4y*n1x) + (n2x*p4y-n2y*p4x)*d)/len2;
+      const q1x = -q2x-q3x-q4x, q1y = -q2y-q3y-q4y, q1z = -q2z-q3z-q4z;
+      const sum = w1*(q1x*q1x+q1y*q1y+q1z*q1z) + w2*(q2x*q2x+q2y*q2y+q2z*q2z)
+                + w3*(q3x*q3x+q3y*q3y+q3z*q3z) + w4*(q4x*q4x+q4y*q4y+q4z*q4z);
+      if (sum < 1e-12) continue;
+      let qdotv = 0;
+      if (gamma !== 0) {
+        qdotv = q1x*(pos[a]-prevPos[a]) + q1y*(pos[a+1]-prevPos[a+1]) + q1z*(pos[a+2]-prevPos[a+2])
+              + q2x*(pos[b]-prevPos[b]) + q2y*(pos[b+1]-prevPos[b+1]) + q2z*(pos[b+2]-prevPos[b+2])
+              + q3x*(pos[c]-prevPos[c]) + q3y*(pos[c+1]-prevPos[c+1]) + q3z*(pos[c+2]-prevPos[c+2])
+              + q4x*(pos[f]-prevPos[f]) + q4y*(pos[f+1]-prevPos[f+1]) + q4z*(pos[f+2]-prevPos[f+2]);
+      }
+      const D = (1 + gamma) * sum + alphaTilde * s2;
+      const corr = (-s * (C + alphaTilde * hlambda[e]) - gamma * qdotv) / D;
+      hlambda[e] += s * corr;
+      if (w1) { const g = w1*corr; pos[a] += g*q1x; pos[a+1] += g*q1y; pos[a+2] += g*q1z; }
+      if (w2) { const g = w2*corr; pos[b] += g*q2x; pos[b+1] += g*q2y; pos[b+2] += g*q2z; }
+      if (w3) { const g = w3*corr; pos[c] += g*q3x; pos[c+1] += g*q3y; pos[c+2] += g*q3z; }
+      if (w4) { const g = w4*corr; pos[f] += g*q4x; pos[f+1] += g*q4y; pos[f+2] += g*q4z; }
+    }
+  }
+
+  _substep(h, time) {
+    const { pos, prevPos, vel, pinned, count } = this;
+    const gh = -this.gravity * h;
+    for (let p = 0; p < count; p++) {
+      const k = p * 3;
+      prevPos[k] = pos[k]; prevPos[k+1] = pos[k+1]; prevPos[k+2] = pos[k+2];
+      if (pinned[p]) continue;
+      vel[k+2] += gh;
+      pos[k] += vel[k]*h; pos[k+1] += vel[k+1]*h; pos[k+2] += vel[k+2]*h;
+    }
+    this._prescribe(time);
+    this._clearMultipliers();
+    for (let it = 0; it < this.iterations; it++) {
+      this._solveDistance(h);
+      this._solveBending(h);
+    }
+    const invH = 1 / h;
+    for (let p = 0; p < count; p++) {
+      const k = p * 3;
+      vel[k] = (pos[k] - prevPos[k]) * invH;
+      vel[k+1] = (pos[k+1] - prevPos[k+1]) * invH;
+      vel[k+2] = (pos[k+2] - prevPos[k+2]) * invH;
+    }
+  }
+
+  step(dt, time) {
+    const h = dt / this.substeps;
+    for (let s = 0; s < this.substeps; s++) {
+      this._substep(h, time + (s + 1) * h);
+    }
+  }
+}
+
+// ---- Math helpers ----
+function mat4Multiply(out, a, b) {
+  for (let c = 0; c < 4; c++) {
+    const b0 = b[c*4+0], b1 = b[c*4+1], b2 = b[c*4+2], b3 = b[c*4+3];
+    for (let r = 0; r < 4; r++) {
+      out[c*4+r] = a[0*4+r]*b0 + a[1*4+r]*b1 + a[2*4+r]*b2 + a[3*4+r]*b3;
+    }
+  }
+  return out;
+}
+
+function mat4Perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2);
+  const nf = 1 / (near - far);
+  const m = new Float32Array(16);
+  m[0]  = f / aspect;
+  m[5]  = f;
+  m[10] = far * nf;
+  m[11] = -1;
+  m[14] = far * near * nf;
+  return m;
+}
+
+function mat4LookAt(eye, target, up) {
+  let zx = eye[0]-target[0], zy = eye[1]-target[1], zz = eye[2]-target[2];
+  let len = Math.hypot(zx, zy, zz) || 1;  zx/=len; zy/=len; zz/=len;
+  let xx = up[1]*zz - up[2]*zy, xy = up[2]*zx - up[0]*zz, xz = up[0]*zy - up[1]*zx;
+  len = Math.hypot(xx, xy, xz) || 1;      xx/=len; xy/=len; xz/=len;
+  const yx = zy*xz - zz*xy, yy = zz*xx - zx*xz, yz = zx*xy - zy*xx;
+  return new Float32Array([
+    xx, yx, zx, 0,
+    xy, yy, zy, 0,
+    xz, yz, zz, 0,
+    -(xx*eye[0] + xy*eye[1] + xz*eye[2]),
+    -(yx*eye[0] + yy*eye[1] + yz*eye[2]),
+    -(zx*eye[0] + zy*eye[1] + zz*eye[2]),
+    1,
+  ]);
+}
+
+// ---- WebGPU setup ----
+(async function() {
+  if (!navigator.gpu) { alert('WebGPU not supported'); return; }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { alert('No WebGPU adapter'); return; }
+  const device = await adapter.requestDevice();
+
+  const canvas = document.getElementById('canvas');
+  const context = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.floor(canvas.clientWidth * dpr);
+  const height = Math.floor(canvas.clientHeight * dpr);
+  canvas.width = width;
+  canvas.height = height;
+  context.configure({ device, format, size: [width, height] });
+
+  // Cloth instance
+  const cloth = new Cloth(number_tringles, size_m);
+  const vertexCount = cloth.count;
+  const vertexData = new Float32Array(vertexCount * 3);
+
+  // Buffers
+  const posBuffer = device.createBuffer({
+    size: vertexCount * 3 * 4,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+
+  const triIndices = cloth.triangleIndices();
+  const triIndexBuffer = device.createBuffer({
+    size: triIndices.byteLength,
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(triIndexBuffer, 0, triIndices);
+
+  const lineIndices = cloth.lineIndices();
+  const lineIndexBuffer = device.createBuffer({
+    size: lineIndices.byteLength,
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(lineIndexBuffer, 0, lineIndices);
+
+  // Uniforms (MVP only)
+  const eye = [2.5, 2.5, 4.0];
+  const target = [0, 0, 0];
+  const up = [0, 0, 1];
+  const view = mat4LookAt(eye, target, up);
+  const proj = mat4Perspective(Math.PI / 6, width / height, 0.1, 20);
+  const mvp = mat4Multiply(new Float32Array(16), proj, view);
+
+  const uniformBuffer = device.createBuffer({
+    size: 16 * 4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniformBuffer, 0, mvp);
+
+  // Shaders
+  const shaderModule = device.createShaderModule({
+    code: `
+      struct Uniforms { mvp : mat4x4<f32> };
+      @group(0) @binding(0) var<uniform> u : Uniforms;
+
+      @vertex
+      fn vsSolid(@location(0) pos : vec3<f32>) -> @builtin(position) vec4<f32> {
+        return u.mvp * vec4<f32>(pos, 1.0);
+      }
+
+      @vertex
+      fn vsWire(@location(0) pos : vec3<f32>) -> @builtin(position) vec4<f32> {
+        var p = u.mvp * vec4<f32>(pos, 1.0);
+        p.z -= 0.0005 * p.w;
+        return p;
+      }
+
+      @fragment
+      fn fsSolid() -> @location(0) vec4<f32> {
+        return vec4<f32>(0.72, 0.34, 0.30, 1.0);
+      }
+
+      @fragment
+      fn fsWire() -> @location(0) vec4<f32> {
+        return vec4<f32>(0.04, 0.05, 0.07, 1.0);
+      }
+    `
+  });
+
+  // Pipelines
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } }]
+  });
+  const bindGroup = device.createBindGroup({
+    layout: bindGroupLayout,
+    entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
+  });
+  const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+
+  const positionLayout = {
+    arrayStride: 3 * 4,
+    attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }]
+  };
+
+  const solidPipeline = device.createRenderPipeline({
+    layout: pipelineLayout,
+    vertex: { module: shaderModule, entryPoint: 'vsSolid', buffers: [positionLayout] },
+    fragment: { module: shaderModule, entryPoint: 'fsSolid', targets: [{ format }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+  });
+
+  const wirePipeline = device.createRenderPipeline({
+    layout: pipelineLayout,
+    vertex: { module: shaderModule, entryPoint: 'vsWire', buffers: [positionLayout] },
+    fragment: { module: shaderModule, entryPoint: 'fsWire', targets: [{ format }] },
+    primitive: { topology: 'line-list' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less-equal' },
+  });
+
+  // Depth texture
+  const depthTexture = device.createTexture({
+    size: [width, height],
+    format: 'depth24plus',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+
+  // ---- Gravity toggle ----
+  const gravityBtn = document.getElementById('gravityBtn');
+  let gravityOn = true;
+  gravityBtn.addEventListener('click', () => {
+    gravityOn = !gravityOn;
+    cloth.gravity = gravityOn ? 9.81 : 0;
+    gravityBtn.textContent = gravityOn ? 'Gravity: ON' : 'Gravity: OFF';
+  });
+
+  // ---- Render loop ----
+  let simTime = 0;
+  const FIXED_DT = 1 / 60;
+  let lastTime = performance.now();
+  let accumulator = 0;
+
+  function frame(now) {
+    const dt = Math.min((now - lastTime) / 1000, 0.25);
+    lastTime = now;
+
+    // Physics
+    accumulator += dt;
+    let steps = 0;
+    while (accumulator >= FIXED_DT && steps < 3) {
+      cloth.step(FIXED_DT, simTime);
+      simTime += FIXED_DT;
+      accumulator -= FIXED_DT;
+      steps++;
+    }
+    if (steps === 3) accumulator = 0;
+
+    // Upload positions
+    vertexData.set(cloth.pos);
+    device.queue.writeBuffer(posBuffer, 0, vertexData);
+
+    // Render
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        loadOp: 'clear',
+        clearValue: { r: 0.055, g: 0.066, b: 0.086, a: 1 },
+        storeOp: 'store',
+      }],
+      depthStencilAttachment: {
+        view: depthTexture.createView(),
+        depthClearValue: 1.0,
+        depthLoadOp: 'clear',
+        depthStoreOp: 'store',
+      },
+    });
+
+    pass.setBindGroup(0, bindGroup);
+    pass.setVertexBuffer(0, posBuffer);
+
+    pass.setPipeline(solidPipeline);
+    pass.setIndexBuffer(triIndexBuffer, 'uint32');
+    pass.drawIndexed(triIndices.length);
+
+    pass.setPipeline(wirePipeline);
+    pass.setIndexBuffer(lineIndexBuffer, 'uint32');
+    pass.drawIndexed(lineIndices.length);
+
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>
